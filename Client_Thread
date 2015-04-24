@@ -1,0 +1,20 @@
+package maekawa_verify;
+
+
+public class Client_Thread implements Runnable{
+
+	Maekawa_Client client;
+	String next;
+	String controlMsg;
+	public Client_Thread(String next, String controlMsg){
+		this.next = next;
+		this.controlMsg = controlMsg;
+		client = new Maekawa_Client();
+	}
+	
+	
+	public void run() {
+		client.live(next, controlMsg);
+	}
+
+}
