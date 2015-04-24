@@ -1,0 +1,47 @@
+package maekawa_verify;
+
+public class CSCheck{
+
+	Integer csClock;
+	Integer pClock;
+	
+	public CSCheck(Integer c, Integer cl){
+		csClock = c;
+		pClock = cl;
+	}
+	
+	public synchronized void get(){
+			try {
+				wait();
+			} catch (InterruptedException e) {
+				e.printStackTrace();
+			}
+	}
+	
+	// Does the dual function:
+	// 1. Un-Blocks the waiting CS_Thread
+	// 2. Gives the latest CS_Time.
+	public synchronized void set(Integer csClock, Integer clock){
+		this.csClock = csClock;
+		this.pClock = clock;
+		notify();
+		System.out.println("Notify the CS Thread");
+	}
+
+	public Integer getCsClock() {
+		return csClock;
+	}
+
+	public void setCsClock(Integer csClock) {
+		this.csClock = csClock;
+	}
+
+	public Integer getClock() {
+		return pClock;
+	}
+
+	public void setClock(Integer clock) {
+		this.pClock = clock;
+	}
+	
+}
