@@ -1,0 +1,559 @@
+package maekawa_verify;
+
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.LinkedList;
+import java.util.TreeMap;
+import com.sun.nio.sctp.MessageInfo;
+import com.sun.nio.sctp.SctpChannel;
+import com.sun.nio.sctp.SctpServerChannel;
+
+// Assumption: once process send REQ for CS, it can only send another REQ, when it has completed its current REQ for CS.
+// So priority queue will not have duplicate requests from same process
+// format, "process_id,timestamp"
+// Issues:
+// 1. Need to check for proper quorums, property of intersection between every quorum - No longer required
+// 2. Need to increment CLOCK, randomly - 
+// only if I am the process, so the inter-critical section time and duration of critical section has to be done.
+// Process - clock runs for each process, 
+
+public class Maekawa_Server {
+
+	private static final int MESSAGE_SIZE = 1000;
+	
+	Process pro;
+	int timeCounter = 0;			// (as Process)
+	ArrayList<String> timeBasket = new ArrayList<String>(); 
+	ArrayList<Integer> pid = new ArrayList<Integer>();
+	// Map<Integer, String> - <2, dc21-1234>
+	TreeMap<Integer, String> nodeValue;
+	// keeps track whether I am in C.S. or not.
+	boolean critical = false;		// (as Process)
+	int lockCount = 0;				// (as Process)
+	ArrayList<Integer> lockQueue = new ArrayList<Integer>();
+	// format s,t
+	LinkedList<String> csTime = new LinkedList<String>();		// (as Process)
+	// Critical Section Logical Clock
+	CSCheck csCheck;					// (as Process), keeps the latest my clock time, CS clock time
+	
+	// If I have already sent an inquire message then no need to send it twice to same destination
+	// INQUIRE is sent only the process who has my lock
+	// True - if sent INQ to lock holder.
+	// False - if received YIELD from lock holder or INQ not yet sent.
+	boolean inquire = false;		// (as Quorum)
+	// List of processes(processIDs) who sent me FAILED messages
+	ArrayList<Integer> fails = new ArrayList<Integer>();		// (as Process)
+	
+	/**
+	 * Message Format:
+	 * REQ,P(i),T(i)	sent as Process
+	 * REL,P(i)			sent as Process
+	 * YIELD,P(i)		sent as Process
+	 * LOCK,P(i)		sent as Quorum
+	 * INQ,P(i)			sent as Quorum
+	 * FAIL,P(i)		sent as Quorum
+	 * 
+	 * GO,s,t - sent from my CS thread to myself, 
+	 * GO - tells to send REL messages to Quorum, 
+	 * s - tells logical clock time (Start Time).
+	 * t - tells logical clock time (End Time). 
+	 */
+	
+	public Maekawa_Server(int index, ArrayList<Integer> quorum, CSCheck csCheck){
+		this.csCheck = csCheck;
+		pro = new Process(index, quorum);
+	}
+	
+	// Need THREE Threads:
+	// Thread 1 - acts as SERVER (incoming, clock, as quorum requests)
+	// Thread 2 - acts as CLIENT
+	// Thread 3 - acts as CS_EXEC 
+	@SuppressWarnings("static-access")
+	public void live(TreeMap<Integer, String> nodes) {
+		// get the list of machineName-portNumber
+		this.nodeValue = nodes;
+		// update the common object
+		pro.incrementClock();
+		csCheck.setClock(pro.getClock());
+		
+		SctpServerChannel serverChannel = null;
+		ByteBuffer byteBuffer = ByteBuffer.allocate(MESSAGE_SIZE);
+		
+		// My port
+		String[] mc = nodeValue.get(pro.getPid()).split("-");
+		int port = Integer.parseInt(mc[1]);
+		System.out.println("Machine:"+mc[0]+", Port:"+mc[1]);
+	try{
+		
+		// Open the server channel
+		serverChannel = SctpServerChannel.open();
+		
+		// socket address at given port
+		InetSocketAddress serverAddr = new InetSocketAddress(port);
+		// Binding the socket address with channel
+		serverChannel.bind(serverAddr);
+	System.out.println("Server Up");
+	// No Termination	
+	while(true){	
+		// Blocks till the receive event occurs
+		SctpChannel sctpCh = serverChannel.accept();
+		MessageInfo messageInfo = sctpCh.receive(byteBuffer, null, null);
+		//System.out.println("MessageInfo: "+messageInfo);
+		
+		String messagePart = byteToString(byteBuffer, messageInfo.bytes());
+		
+		// Clearing to receive message
+		byteBuffer.clear();
+		
+		String controlMsg = null;
+		String[] msg = messagePart.split(",");
+		
+		// When I am the server
+		
+		// Intermediate node forward to client
+		
+		// TO DO----
+		
+		// On receiving REQ message and I am the destination, behave as QUORUM
+		// compare with first one in non-empty priority queue
+		if(msg[0].equals("REQ")){
+			// message values
+			StringBuffer buf = new StringBuffer().append(msg[1]).append(",").append(msg[2]);
+			System.out.println("GOT REQUEST:"+messagePart);
+			// priority queue is empty
+			if(pro.getRequestQ().isEmpty()){
+				pro.setLockP(Integer.parseInt(msg[1]));
+				pro.setLockT(Integer.parseInt(msg[2]));
+				pro.getRequestQ().add(buf.toString());
+				// need to send the lock message
+				controlMsg = new StringBuffer().append("LOCK").append(",").append(pro.getPid()).toString();
+				// send it to client thread, destination will be msg[1]
+				Thread client = new Thread(new Client_Thread(nodeValue.get(Integer.parseInt(msg[1])), controlMsg));
+				client.start();
+			}
+			else{
+				// For non-empty queue
+				// 1. Check If I am in Critical Section, yes then just add the request to priority queue.
+				// 2. If not in Critical Section, 
+				//		1. Do Comparison of timestamp and process ids.
+				// adds at the proper index as priority queue
+				if(critical){
+					add(buf.toString(), pro.getRequestQ());
+					// Should I send back a failed message or not, TO DO, I think - no need to send FAIL
+				}
+				else{
+					// comparison of Lock values and message values
+					// Lock-timestamp lower than Message, then send failed message
+					if(pro.getLockT() < Integer.parseInt(msg[2])){
+						// Still add the request in Priority Queue
+						add(buf.toString(), pro.getRequestQ());
+						controlMsg = new StringBuffer().append("FAIL").append(",").append(pro.getPid()).toString();
+						// send it to client thread, destination will be msg[1]
+						Thread client = new Thread(new Client_Thread(nodeValue.get(Integer.parseInt(msg[1])), controlMsg));
+						client.start();
+						
+					}
+					else if(pro.getLockT() > Integer.parseInt(msg[2])){
+						// lock holder has higher timestamp
+						add(buf.toString(), pro.getRequestQ());
+						inquire = true;
+						controlMsg = new StringBuffer().append("INQ").append(",").append(pro.getPid()).toString();
+						// send it to client thread, destination will be pro.getLockP() - lock holder
+						Thread client = new Thread(new Client_Thread(nodeValue.get(pro.getLockP()), controlMsg));
+						client.start();
+						
+					}
+					else if(pro.getLockT() == Integer.parseInt(msg[2])){
+						// need to compare process ids
+						if(pro.getLockP() < Integer.parseInt(msg[1])){
+							// Still add the request in Priority Queue
+							add(buf.toString(), pro.getRequestQ());
+							controlMsg = new StringBuffer().append("FAIL").append(",").append(pro.getPid()).toString();
+							// send it to client thread, destination will be msg[1]
+							Thread client = new Thread(new Client_Thread(nodeValue.get(Integer.parseInt(msg[1])), controlMsg));
+							client.start();
+						}
+						else if(pro.getLockP() > Integer.parseInt(msg[1])){
+							// lock holder has same timestamp but higher process id
+							add(buf.toString(), pro.getRequestQ());
+							inquire = true;
+							controlMsg = new StringBuffer().append("INQ").append(",").append(pro.getPid()).toString();
+							// send it to client thread, destination will be pro.getLockP() - lock holder
+							Thread client = new Thread(new Client_Thread(nodeValue.get(pro.getLockP()), controlMsg));
+							client.start();
+						}
+						else if(pro.getLockP() == Integer.parseInt(msg[1])){
+							throw new Exception("ERROR: Process ids cannot be same");
+						}
+					}
+				}// else of not being in critical section
+				
+			} // else part of non-empty requestQ
+			
+		}
+		
+		// Message received from my CS Thread
+		// format - 'GO,s,t,P(i)'
+		// For verification purpose, this is PHASE ONE - collects the critical section time
+		else if(msg[0].equals("GO")){
+			System.out.println("GOT GO:"+messagePart);
+			// Check if myself
+			if(pro.getPid() == Integer.parseInt(msg[3])){
+				// As msg[2] value is my own latest csClock time
+				//csCheck.setCsClock(max( csCheck.getCsClock(),Integer.parseInt(msg[2]) ) + 1);
+				critical = false;
+				lockCount = 0;
+				// PHASE ONE
+				csTime.add(new StringBuffer().append(msg[1]).append(":").append(msg[2]).toString());
+				// Need to send out REL to my QUORUM
+				Thread.currentThread().sleep(2000);
+				for(int i = 0; i < pro.getQuorum().size(); i++){
+					controlMsg = new StringBuffer().append("REL").append(",").append(pro.getPid()).toString();
+					Thread client = new Thread(new Client_Thread(nodeValue.get(pro.getQuorum().get(i)), controlMsg));
+					client.start();
+				}
+			}
+			else{
+				// just keep the latest csClock
+				csCheck.setCsClock(max( csCheck.getCsClock(),Integer.parseInt(msg[2]) ) + 1);
+			}
+		}
+		
+		// When I get RELEASE message, behave as QUORUM
+		// will get this message from lock holder, REL,P(i)
+		else if(msg[0].equals("REL")){
+			System.out.println("GOT RELEASE:"+messagePart);
+			// it can happen that for my INQ message, I get REL message back, as lock holder did not reply YIELD
+			inquire = false;
+			
+			// need to find(compare pid) my index in priority queue, then remove it
+			for(int i=0; i < pro.getRequestQ().size(); i++){
+				String value = (String)pro.getRequestQ().get(i);
+				String[] temp = value.split(",");
+				// Compares ProcessIDs
+				if(temp[0].equals(msg[1])){
+					pro.getRequestQ().remove(i);
+					break;
+				}
+			}
+			if(pro.getRequestQ().isEmpty()){
+				// No one has request for my lock
+				System.out.println("No Pending Request in "+pro.getPid());
+				pro.setRequestQ(new ArrayList<String>());
+				pro.setLockP(-1);
+				pro.setLockT(-1);
+			}
+			else{
+				String value = (String) pro.getRequestQ().get(0);
+				String[] temp = value.split(",");
+				pro.setLockP(Integer.parseInt(temp[0]));
+				pro.setLockT(Integer.parseInt(temp[1]));
+				// need to send the lock message
+				controlMsg = new StringBuffer().append("LOCK").append(",").append(pro.getPid()).toString();
+				// send it to client thread, destination will be pro.getLockP() - lock holder
+				Thread client = new Thread(new Client_Thread(nodeValue.get(pro.getLockP()), controlMsg));
+				client.start();
+			}
+		}
+		
+		// When I get YIELD message, behave as QUORUM, change the value of lock variable(pick the first from requestQ)
+		// reset the inquire flag
+		else if(msg[0].equals("YIELD")){
+			System.out.println("GOT YIELD:"+messagePart);
+			inquire = false;
+			String value = (String) pro.getRequestQ().get(0);
+			String[] temp = value.split(",");
+			// overriding the Lock values
+			pro.setLockP(Integer.parseInt(temp[0]));
+			pro.setLockT(Integer.parseInt(temp[1]));
+			// need to send the lock message
+			controlMsg = new StringBuffer().append("LOCK").append(",").append(pro.getPid()).toString();
+			// send it to client thread, destination will be pro.getLockP() - lock holder
+			Thread client = new Thread(new Client_Thread(nodeValue.get(pro.getLockP()), controlMsg));
+			client.start();
+		}
+		
+		// A PROCESS GETS FOLLOWING MESSAGES
+		
+		// When I get LOCK message, behave as PROCESS
+		// keep a counter of lock messages received so far, check my Quorum size
+		else if(msg[0].equals("LOCK")){
+			System.out.println("GOT LOCK:"+messagePart);
+			// Process Clock incremented
+			pro.incrementClock();
+			csCheck.setClock(pro.getClock());
+			// If I get a LOCK, increment counter
+			lockCount++;
+			// Need remove from FAIL list if any
+			if(fails.contains(Integer.parseInt(msg[1]))){
+				fails.remove(fails.indexOf(Integer.parseInt(msg[1])));
+			}
+			// if I get the locks from all my quorum members
+			if(lockCount == pro.getQuorum().size()){
+				/*
+				 * CODE FOR CRITICAL SECTION
+				 * CS THREAD called - THIS thread will send out GO,s,t,P(i) messages once done
+				 * Server will receive the GO messages then send out REL messages to QUORUM members
+				 * 
+				 */
+				// Here will notify the object on csCheck
+				/*Thread cs = new Thread(new CS_Thread(csClock, nodeValue, pro.getPid()));
+				cs.start();*/
+				System.out.println("Going for CS : "+pro.getPid());
+				csCheck.set(csCheck.getCsClock(), csCheck.getClock());
+			}
+		}
+		
+		// When I get INQ message, behave as PROCESS
+		// check if I got any FAIL message, if yes only then yield
+		else if(msg[0].equals("INQ")){
+			System.out.println("GOT INQUIRE:"+messagePart);
+			// Process Clock incremented
+			pro.incrementClock();
+			csCheck.setClock(pro.getClock());
+			if(critical){
+				// When I am in critical section, discard INQ message, do not respond
+			}
+			else{
+				// If FAILED messages are removed then just send the YIELD message
+				// I have received a FAIL message, FAILS list is non-empty
+				if( !fails.isEmpty() ){
+					// decrement counter, as held Lock is being given away
+					lockCount--;
+					// need to send the yield message
+					controlMsg = new StringBuffer().append("YIELD").append(",").append(pro.getPid()).toString();
+					// send it to client thread, destination will be msg[1]
+					Thread client = new Thread(new Client_Thread(nodeValue.get(Integer.parseInt(msg[1])), controlMsg));
+					client.start();
+				}
+				else{
+					// Haven't received any FAIL messages
+					// Do not yield then
+				}
+			}
+		}
+		
+		// When I get FAIL message, behave as PROCESS
+		else if(msg[0].equals("FAIL")){
+			System.out.println("GOT FAILED:"+messagePart);
+			// Process Clock incremented
+			pro.incrementClock();
+			csCheck.setClock(pro.getClock());
+			// Add the processID who sent me FAIL message, no duplicate ProcessIDS - ASSUMPTION
+			// Keeps the check for corresponding processes who sent me FAIL messages
+			// On receiving LOCK from them I should remove them from List
+			fails.add(Integer.parseInt(msg[1]));
+		}
+		
+		else if(msg[0].equals("INFO")){
+			System.out.println("GOT CS INFO:"+messagePart);
+			StringBuffer buffer = null;
+			if(!csTime.isEmpty()){
+				buffer = new StringBuffer().append("TIME").append(",").append(pro.getPid());
+				for(String i : csTime){
+					buffer.append(",").append(i);
+				}
+			}
+			else{
+				buffer = new StringBuffer().append("TIME").append(",").append(pro.getPid()).append(",").append("-1");
+			}
+			Thread client = new Thread(new Client_Thread(nodeValue.get( Integer.parseInt(msg[1]) ), buffer.toString()) );
+			client.start();
+			// could also reset the csTime
+		}
+		
+		else if(msg[0].equals("TIME")){
+			System.out.println("GOT CS TIME:"+messagePart);
+			timeCounter++;
+			if(msg[2].equals("-1"))
+			{
+				if(timeCounter==nodeValue.size()){
+					System.out.println("***** No Critical Section Executed *****");
+					timeCounter = 0;
+				}
+				continue;
+			}
+			// adding the process id whose time is added
+			for(int i=2; i<msg.length ;i++)
+			{
+				timeBasket.add(msg[i]);
+				pid.add(Integer.parseInt(msg[1]));
+			}
+			if(timeCounter==nodeValue.size())
+			{
+				for(int i=0; i< timeBasket.size(); i++)
+				{
+					System.out.print(timeBasket.get(i)+",");
+					System.out.print(pid.get(i)+",");
+				}
+				timeCounter = 0;
+				// Verification Can be given to different Thread for computation
+				verify(timeBasket, pid);
+			}
+			
+		}
+	} // end of While
+	}
+	catch(Exception e){
+		e.printStackTrace();
+	}
+}
+
+	// Verify the Overlapping of Critical Section Times.
+	public void verify(ArrayList<String> timeBasket, ArrayList<Integer> pid){
+		ArrayList<Integer> start = new ArrayList<Integer>();
+		ArrayList<Integer> end = new ArrayList<Integer>();
+		ArrayList<Integer> processID = new ArrayList<Integer>();
+		
+		for(int i=0; i < timeBasket.size(); i++){
+			String[] words = timeBasket.get(i).split(":");
+			int s = Integer.parseInt(words[0]);
+			int t = Integer.parseInt(words[1]);
+			insert(s,t,start,end,processID,pid.get(i));
+		}
+		Boolean mutual = true;
+		// Checking Overlaps
+		for(int i=0; i < end.size()-1; i++){
+			if(end.get(i) <= start.get(i+1)){
+				continue;
+			}
+			else{
+				System.out.println("*****\\ Mutual Exclusion Violated /*****");
+				// Add who violated the mutual exclusion
+				System.out.println("*****\\ Violating Processes : "+processID.get(i)+" and "+processID.get(i+1)+" /*****");
+				//return;
+				mutual = false;
+			}
+		}
+		if(mutual)
+		{
+			System.out.println("***** Mutual Exclusion Successful *****");
+		}
+	}
+	
+	// Assumes start and end are already sorted
+	// Like Insertion Sort
+	void insert(int s, int t, ArrayList<Integer> start, ArrayList<Integer> end, ArrayList<Integer> process, int pid){
+		// First Element
+		if(start.isEmpty() && end.isEmpty()){
+			start.add(s);
+			end.add(t);
+			process.add(pid);
+		}
+		else{
+			for(int i = 0; i < start.size(); i++){
+				if(start.get(i) < s){
+					if(i == (start.size()-1)){
+						start.add(s);
+						end.add(t);
+						process.add(pid);
+						break;
+					}
+					else{
+						continue;
+					}
+				}
+				else if(start.get(i) == s){
+					if(end.get(i) < t){
+						if(i == (start.size()-1)){
+							start.add(s);
+							end.add(t);
+							process.add(pid);
+							break;
+						}
+						else{
+							continue;
+						}
+					}
+					else if(end.get(i) >= t){
+						start.add(i,s);
+						end.add(i,t);
+						process.add(i,pid);
+						break;
+					}
+				}
+				else{
+					start.add(i,s);
+					end.add(i,t);
+					process.add(i,pid);
+					break;
+				}
+			}
+		}
+	}
+	
+	// Adds the element at correct index 
+	public void add(String request, ArrayList<String> requestQ){
+		for(int i=0; i < requestQ.size(); i++){
+			String value = (String) requestQ.get(i);
+			String[] temp = value.split(",");
+			String[] req = request.split(",");
+			if(Integer.parseInt(req[1]) < Integer.parseInt(temp[1])){
+				requestQ.add(i, request);
+				break;
+			}
+			else if(Integer.parseInt(req[1]) == Integer.parseInt(temp[1])){
+				if(Integer.parseInt(req[0]) < Integer.parseInt(temp[0])){
+					requestQ.add(i, request);
+					break;
+				}
+				else if(i == requestQ.size()-1){
+					requestQ.add(request);
+					break;
+				}
+			}
+			else if(i == requestQ.size()-1){
+				requestQ.add(request);
+				break;
+			}
+		}
+	}
+	
+	// sorts the request queue as priority
+	// sort by ascending timestamps, if timestamps equal then sort by ascending process ids
+	// format, "process_id,timestamp"
+	public void sortQ(ArrayList<String> requestQ){
+		for(int i=0; i< (requestQ.size()-1); i++){
+			int small = i;
+			for(int j = i+1; j < requestQ.size(); j++){
+				String value1 = (String) requestQ.get(small);
+				String[] temp1 = value1.split(",");
+				String value2 = (String) requestQ.get(j);
+				String[] temp2 = value2.split(",");
+				// if timestamp is lower
+				if(Integer.parseInt(temp1[1]) > Integer.parseInt(temp2[1])){
+					small = j;
+				}
+				// if timestamp is equal
+				else if(Integer.parseInt(temp1[1]) == Integer.parseInt(temp2[1])){
+					// check for process ids
+					if(Integer.parseInt(temp1[0]) > Integer.parseInt(temp2[0])){
+						small = j;
+					}
+				}
+			}// inner for loop
+		String swap = (String)requestQ.get(i);
+		requestQ.set(i, requestQ.get(small));
+		requestQ.set(small, swap);
+		}
+		
+		
+	}
+
+	public int max(int x, int y){
+		(x < y) ? return y : return x;
+	}
+	
+	// This is returning the whole Message Size, need to find the Message
+	public String byteToString(ByteBuffer byteBuffer, int length)
+	{
+		byteBuffer.position(0);
+		byteBuffer.limit(MESSAGE_SIZE);
+		// remaining() - Returns the number of elements between the current position and the limit.
+		byte[] bufArr = new byte[length];
+		byteBuffer.get(bufArr);
+		return new String(bufArr);
+	}
+	
+}
