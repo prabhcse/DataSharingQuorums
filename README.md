@@ -16,5 +16,7 @@ CS_Check has dual purpose:
 2. It provides the mechanism of Logical clock just for Critical Section, used to verify that there is no overlap between Critical Section execution of multiple processes. This logical clock is different from Process's own logical clock.
 
 PS:
+
 (1) The process object can be converted to a process thread, thereby decoupling it from server mechanism.
-(2) Sinle client thread handles all the outgoing requests via  FIFO queue like : Producer-Consumer logic.
+
+(2) Single client thread handles all the outgoing requests via  FIFO queue like : Producer-Consumer logic.
